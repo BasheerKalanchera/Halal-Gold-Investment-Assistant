@@ -1,7 +1,3 @@
-__import__('pysqlite3')
-import sys
-sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
-
 import streamlit as st
 import os
 from dotenv import load_dotenv
@@ -10,13 +6,13 @@ import uuid  # Import the uuid library
 
 # LangChain and related imports
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
-from langchain_chroma import Chroma
+from langchain_community.vectorstores import FAISS
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 
 # Imports for ParentDocumentRetriever
-from langchain.retrievers import ParentDocumentRetriever
+from langchain.retrievers.multi_vector import MultiVectorRetriever
 from langchain.storage import InMemoryStore
 from langchain.docstore.document import Document
 
@@ -66,28 +62,43 @@ if not parent_documents_list:
     parent_documents_list.append(Document(page_content=raw_text_content, metadata={"source": GOLD_ETF_FILE_PATH, "section_title": "Full Document"}))
 
 
-# --- ParentDocumentRetriever Setup ---
-child_splitter = RecursiveCharacterTextSplitter(chunk_size=400, chunk_overlap=50)
+# --- FAISS MultiVectorRetriever Setup ---
+# This is the modern way to handle Parent-Child retrieval with FAISS.
 
-# FIX: Use a unique collection name for each session to ensure a fresh start
-# This prevents "ghost data" from previous runs from contaminating the results.
-collection_name = f"gold_etf_collection_{uuid.uuid4()}"
-vectorstore = Chroma(
-    collection_name=collection_name, 
-    embedding_function=embeddings
+# 1. Set up the vector store for the small child chunks
+vectorstore = FAISS.from_texts(
+    texts=[" "], # Start with a dummy document
+    embedding=embeddings
 )
 
+# 2. Set up the store for the large parent documents
 store = InMemoryStore()
+id_key = "doc_id"
 
-retriever = ParentDocumentRetriever(
+# 3. Create the MultiVectorRetriever
+retriever = MultiVectorRetriever(
     vectorstore=vectorstore,
     docstore=store,
-    child_splitter=child_splitter,
-    search_kwargs={"k": 5}
+    id_key=id_key,
 )
 
-# Add the clean, non-overlapping parent documents
-retriever.add_documents(parent_documents_list)
+# 4. Create unique IDs for each parent document
+doc_ids = [str(uuid.uuid4()) for _ in parent_documents_list]
+
+# 5. Create the child documents for searching
+child_splitter = RecursiveCharacterTextSplitter(chunk_size=400, chunk_overlap=50)
+sub_docs = []
+for i, doc in enumerate(parent_documents_list):
+    _id = doc_ids[i]
+    _sub_docs = child_splitter.split_documents([doc])
+    for _doc in _sub_docs:
+        _doc.metadata[id_key] = _id
+    sub_docs.extend(_sub_docs)
+
+# 6. Add the documents to the retriever
+# This populates the vectorstore with the child chunks and the docstore with the parent chunks
+retriever.vectorstore.add_documents(sub_docs)
+retriever.docstore.mset(list(zip(doc_ids, parent_documents_list)))
 
 
 # --- RAG Chain Definition ---

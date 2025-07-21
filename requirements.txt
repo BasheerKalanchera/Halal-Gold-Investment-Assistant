@@ -1,9 +1,8 @@
 streamlit
 langchain
 langchain-google-genai==1.0.2
-langchain-chroma
+faiss-cpu
 python-dotenv
 uuid
-pysqlite3-binary
 grpcio==1.62.2
 protobuf==4.25.3
