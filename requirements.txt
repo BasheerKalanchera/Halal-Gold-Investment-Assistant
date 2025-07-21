@@ -2,7 +2,5 @@ streamlit
 langchain
 langchain-google-genai==1.0.2
 faiss-cpu
-python-dotenv
-uuid
 grpcio==1.62.2
 protobuf==4.25.3
