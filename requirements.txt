@@ -1,6 +1,4 @@
 streamlit
 langchain
-langchain-google-genai==1.0.2
+langchain-google-genai
 faiss-cpu
-grpcio==1.62.2
-protobuf==4.25.3
