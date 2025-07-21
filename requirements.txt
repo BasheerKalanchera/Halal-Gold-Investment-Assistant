@@ -4,3 +4,4 @@ langchain-google-genai
 langchain-chroma
 python-dotenv
 uuid
+pysqlite3-binary
