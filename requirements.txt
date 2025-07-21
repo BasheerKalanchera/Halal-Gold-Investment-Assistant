@@ -2,3 +2,4 @@ streamlit
 langchain
 langchain-google-genai
 faiss-cpu
+python-dotenv
