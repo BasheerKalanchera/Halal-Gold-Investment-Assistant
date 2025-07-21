@@ -1,3 +1,9 @@
+import asyncio
+import sys
+
+if sys.platform.startswith('linux') and sys.version_info >= (3, 8):
+    asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
+
 import streamlit as st
 import os
 from dotenv import load_dotenv
