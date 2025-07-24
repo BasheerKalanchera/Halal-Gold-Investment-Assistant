@@ -1,120 +1,107 @@
-import asyncio
-import sys
-
-if sys.platform.startswith('linux') and sys.version_info >= (3, 8):
-    asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
-
 import streamlit as st
 import os
 from dotenv import load_dotenv
 import re
-import uuid  # Import the uuid library
+import uuid
 
 # LangChain and related imports
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_community.embeddings import HuggingFaceInstructEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
-
-# Imports for ParentDocumentRetriever
-from langchain.retrievers.multi_vector import MultiVectorRetriever
 from langchain.storage import InMemoryStore
 from langchain.docstore.document import Document
+from langchain.retrievers.multi_vector import MultiVectorRetriever
 
+# Load environment variables from .env file for local development
 load_dotenv()
 
+# --- Configuration ---
+# Ensure the Google API Key is available
 if "GOOGLE_API_KEY" not in os.environ:
-    st.error("GOOGLE_API_KEY not found in environment variables. Please set it in a .env file.")
+    st.error("GOOGLE_API_KEY not found in environment variables. Please set it in your .env file for local testing or in Streamlit secrets for deployment.")
     st.stop()
-
-llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash")
-embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
 
 GOLD_ETF_FILE_PATH = "Halal_gold_info.txt"
 
-raw_text_content = ""
-try:
-    with open(GOLD_ETF_FILE_PATH, "r", encoding="utf-8") as f:
+# --- Caching Setup for Performance ---
+
+@st.cache_resource
+def load_embedding_model():
+    """Loads the HuggingFace Embedding Model only once."""
+    st.write("Cache miss: Loading embedding model...") # Log message for debugging
+    return HuggingFaceInstructEmbeddings(
+        model_name="hkunlp/instructor-large",
+        model_kwargs={"device": "cpu"}
+    )
+
+@st.cache_resource
+def create_retriever(file_path, _embeddings):
+    """
+    Creates an advanced MultiVectorRetriever to handle parent/child chunking.
+    This ensures that the full context (like a complete table) is retrieved.
+    """
+    st.write("Cache miss: Creating MultiVectorRetriever...") # Log message for debugging
+    
+    # 1. Load the document
+    with open(file_path, "r", encoding="utf-8") as f:
         raw_text_content = f.read()
-    if not raw_text_content.strip():
-        st.warning(f"The file '{GOLD_ETF_FILE_PATH}' was loaded but appears to be empty.")
-        st.stop()
-except FileNotFoundError:
-    st.error(f"Error: The file '{GOLD_ETF_FILE_PATH}' was not found.")
-    st.info("Please make sure 'gold_etf_info.txt' is in the same directory as the app.")
-    st.stop()
-except Exception as e:
-    st.error(f"An error occurred while loading '{GOLD_ETF_FILE_PATH}': {e}")
-    st.stop()
+    
+    # 2. Split the document into logical parent chunks using a simple and robust method.
+    parent_chunks = []
+    # Use Python's built-in split method for reliability
+    for section in raw_text_content.split('\n---\n'):
+        if section.strip(): # Ensure the section is not empty
+            parent_chunks.append(Document(page_content=section.strip()))
+    
+    st.write(f"Created {len(parent_chunks)} parent chunks.") # Debugging line
 
-# --- FINAL, ROBUST CHUNKING LOGIC ---
-# This method splits the document into parent documents using "---" as a delimiter.
-parent_documents_list = []
-# Ensure the delimiter is on its own line for an accurate split
-sections = raw_text_content.split('\n---\n')
+    # 3. Setup the components for the MultiVectorRetriever
+    id_key = "doc_id"
+    child_splitter = RecursiveCharacterTextSplitter(chunk_size=400, chunk_overlap=50)
+    vectorstore = FAISS.from_texts([" "], _embeddings) # Initialize with a dummy document
+    store = InMemoryStore()
+    
+    # 4. Create the retriever
+    retriever = MultiVectorRetriever(
+        vectorstore=vectorstore,
+        docstore=store,
+        id_key=id_key,
+    )
+    
+    # 5. Generate unique IDs for each parent chunk
+    doc_ids = [str(uuid.uuid4()) for _ in parent_chunks]
+    
+    # 6. Create smaller child chunks for searching
+    child_chunks = []
+    for i, doc in enumerate(parent_chunks):
+        _id = doc_ids[i]
+        _sub_docs = child_splitter.split_documents([doc])
+        for _doc in _sub_docs:
+            _doc.metadata[id_key] = _id
+        child_chunks.extend(_sub_docs)
+    
+    # 7. Add the documents to the retriever
+    retriever.vectorstore.add_documents(child_chunks)
+    retriever.docstore.mset(list(zip(doc_ids, parent_chunks)))
+    
+    return retriever
 
-for section_text in sections:
-    if section_text.strip():
-        # Use the first line of the section as its title for metadata
-        first_line = section_text.strip().split('\n')[0]
-        parent_documents_list.append(Document(
-            page_content=section_text.strip(),
-            metadata={"source": GOLD_ETF_FILE_PATH, "section_title": first_line}
-        ))
+# --- Main App Logic ---
 
-if not parent_documents_list:
-    st.warning("No sections found. Using the full document as a single parent.")
-    parent_documents_list.append(Document(page_content=raw_text_content, metadata={"source": GOLD_ETF_FILE_PATH, "section_title": "Full Document"}))
+# Load models and create the retriever using the cached functions
+llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
+embeddings_model = load_embedding_model()
+retriever = create_retriever(GOLD_ETF_FILE_PATH, embeddings_model)
 
-
-# --- FAISS MultiVectorRetriever Setup ---
-# This is the modern way to handle Parent-Child retrieval with FAISS.
-
-# 1. Set up the vector store for the small child chunks
-vectorstore = FAISS.from_texts(
-    texts=[" "], # Start with a dummy document
-    embedding=embeddings
-)
-
-# 2. Set up the store for the large parent documents
-store = InMemoryStore()
-id_key = "doc_id"
-
-# 3. Create the MultiVectorRetriever
-retriever = MultiVectorRetriever(
-    vectorstore=vectorstore,
-    docstore=store,
-    id_key=id_key,
-)
-
-# 4. Create unique IDs for each parent document
-doc_ids = [str(uuid.uuid4()) for _ in parent_documents_list]
-
-# 5. Create the child documents for searching
-child_splitter = RecursiveCharacterTextSplitter(chunk_size=400, chunk_overlap=50)
-sub_docs = []
-for i, doc in enumerate(parent_documents_list):
-    _id = doc_ids[i]
-    _sub_docs = child_splitter.split_documents([doc])
-    for _doc in _sub_docs:
-        _doc.metadata[id_key] = _id
-    sub_docs.extend(_sub_docs)
-
-# 6. Add the documents to the retriever
-# This populates the vectorstore with the child chunks and the docstore with the parent chunks
-retriever.vectorstore.add_documents(sub_docs)
-retriever.docstore.mset(list(zip(doc_ids, parent_documents_list)))
-
-
-# --- RAG Chain Definition ---
+# The RAG chain is now built on every run, but this is very fast
+# because the expensive parts (models and retriever) are already in the cache.
 prompt_template = """
 You are a helpful AI assistant specialized in Gold ETFs. Your task is to answer the user's question based strictly on the provided context.
-
 Read the context carefully and synthesize the information that directly answers the question.
-
 If the context provides a clear list of steps, methods, or types that are relevant to the user's question, it is helpful to present your answer as a numbered or bulleted list.
-
 If the context does not contain information to answer the question, you must respond with: "I don't have enough information in the provided documents to answer this question." Do not use any external knowledge.
 
 Context:
@@ -136,7 +123,7 @@ qa_chain = RetrievalQA.from_chain_type(
     chain_type_kwargs={"prompt": PROMPT}
 )
 
-# --- Streamlit App ---
+# --- Streamlit UI ---
 st.set_page_config(page_title="Halal Gold Investment Assistant", layout="centered")
 st.title("💰 Halal Gold Investment Assistant")
 
@@ -147,14 +134,23 @@ if st.button("Get Answer"):
         with st.spinner("Searching and generating answer..."):
             try:
                 result = qa_chain.invoke({"query": user_query})
-                
-                source_documents = result["source_documents"]
                 answer = result["result"]
-
                 st.subheader("Answer:")
                 st.info(answer)
 
-                                
+                # --- Debugging Section ---
+                st.subheader("Debugging Information")
+                with st.expander("View Retrieved Documents"):
+                    # The retriever now returns the parent chunks
+                    if "source_documents" in result and result["source_documents"]:
+                        st.write("The following PARENT chunks were retrieved and sent to the LLM:")
+                        for i, doc in enumerate(result["source_documents"]):
+                            st.markdown(f"**Parent Chunk {i+1}**")
+                            st.code(doc.page_content, language='text')
+                            st.json(doc.metadata)
+                    else:
+                        st.write("No documents were retrieved for this query.")
+
             except Exception as e:
                 st.error(f"An error occurred: {e}")
     else:
