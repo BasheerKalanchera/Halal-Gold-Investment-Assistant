@@ -3,101 +3,81 @@ import os
 from dotenv import load_dotenv
 import re
 import uuid
+import hashlib  # For deterministic IDs
 
 # LangChain and related imports
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_community.embeddings import HuggingFaceInstructEmbeddings
 from langchain_community.vectorstores import FAISS
-from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 from langchain.storage import InMemoryStore
 from langchain.docstore.document import Document
 from langchain.retrievers.multi_vector import MultiVectorRetriever
 
-# Load environment variables from .env file for local development
+# Load environment variables
 load_dotenv()
 
 # --- Configuration ---
-# Ensure the Google API Key is available
 if "GOOGLE_API_KEY" not in os.environ:
-    st.error("GOOGLE_API_KEY not found in environment variables. Please set it in your .env file for local testing or in Streamlit secrets for deployment.")
+    st.error("GOOGLE_API_KEY not found. Please set it in .env or Streamlit secrets.")
     st.stop()
 
 GOLD_ETF_FILE_PATH = "Halal_gold_info.txt"
 
-# --- Caching Setup for Performance ---
-
+# --- Caching Setup ---
 @st.cache_resource
 def load_embedding_model():
-    """Loads the HuggingFace Embedding Model only once."""
-    st.write("Cache miss: Loading embedding model...") # Log message for debugging
     return HuggingFaceInstructEmbeddings(
         model_name="hkunlp/instructor-large",
         model_kwargs={"device": "cpu"}
     )
 
 @st.cache_resource
-def create_retriever(file_path, _embeddings):
+def create_retriever(file_path):
     """
-    Creates an advanced MultiVectorRetriever to handle parent/child chunking.
-    This ensures that the full context (like a complete table) is retrieved.
+    Uses entire Q&A block as a single chunk. No parent-child splitting.
     """
-    st.write("Cache miss: Creating MultiVectorRetriever...") # Log message for debugging
-    
-    # 1. Load the document
+    _embeddings = load_embedding_model()
+
     with open(file_path, "r", encoding="utf-8") as f:
         raw_text_content = f.read()
-    
-    # 2. Split the document into logical parent chunks using a simple and robust method.
-    parent_chunks = []
-    # Use Python's built-in split method for reliability
-    for section in raw_text_content.split('\n---\n'):
-        if section.strip(): # Ensure the section is not empty
-            parent_chunks.append(Document(page_content=section.strip()))
-    
-    st.write(f"Created {len(parent_chunks)} parent chunks.") # Debugging line
 
-    # 3. Setup the components for the MultiVectorRetriever
+    parent_chunks = []
+    for section in raw_text_content.split('\n---\n'):
+        if section.strip():
+            parent_chunks.append(Document(page_content=section.strip()))
+
     id_key = "doc_id"
-    child_splitter = RecursiveCharacterTextSplitter(chunk_size=400, chunk_overlap=50)
-    vectorstore = FAISS.from_texts([" "], _embeddings) # Initialize with a dummy document
+    vectorstore = FAISS.from_texts([" "], _embeddings)
     store = InMemoryStore()
-    
-    # 4. Create the retriever
+
     retriever = MultiVectorRetriever(
         vectorstore=vectorstore,
         docstore=store,
         id_key=id_key,
     )
-    
-    # 5. Generate unique IDs for each parent chunk
-    doc_ids = [str(uuid.uuid4()) for _ in parent_chunks]
-    
-    # 6. Create smaller child chunks for searching
+
+    doc_ids = [hashlib.sha256(doc.page_content.encode()).hexdigest() for doc in parent_chunks]
+
+    # Treat entire Q&A as single retrievable chunk
     child_chunks = []
     for i, doc in enumerate(parent_chunks):
         _id = doc_ids[i]
-        _sub_docs = child_splitter.split_documents([doc])
-        for _doc in _sub_docs:
-            _doc.metadata[id_key] = _id
-        child_chunks.extend(_sub_docs)
-    
-    # 7. Add the documents to the retriever
+        doc.metadata[id_key] = _id
+        child_chunks.append(doc)
+
     retriever.vectorstore.add_documents(child_chunks)
     retriever.docstore.mset(list(zip(doc_ids, parent_chunks)))
-    
+
     return retriever
 
-# --- Main App Logic ---
-
-# Load models and create the retriever using the cached functions
+# --- Load Models & Retriever ---
 llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
-embeddings_model = load_embedding_model()
-retriever = create_retriever(GOLD_ETF_FILE_PATH, embeddings_model)
+retriever = create_retriever(GOLD_ETF_FILE_PATH)
+retriever.search_kwargs = {"k": 8}  # ✅ Increase recall
 
-# The RAG chain is now built on every run, but this is very fast
-# because the expensive parts (models and retriever) are already in the cache.
+# --- Prompt Template ---
 prompt_template = """
 You are a helpful AI assistant specialized in Gold ETFs. Your task is to answer the user's question based strictly on the provided context.
 Read the context carefully and synthesize the information that directly answers the question.
@@ -111,16 +91,14 @@ Question: {question}
 
 Answer:
 """
-PROMPT = PromptTemplate(
-    template=prompt_template, input_variables=["context", "question"]
-)
+PROMPT = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
 
 qa_chain = RetrievalQA.from_chain_type(
     llm=llm,
     chain_type="stuff",
     retriever=retriever,
     return_source_documents=True,
-    chain_type_kwargs={"prompt": PROMPT}
+    chain_type_kwargs={"prompt": PROMPT},
 )
 
 # --- Streamlit UI ---
@@ -138,10 +116,9 @@ if st.button("Get Answer"):
                 st.subheader("Answer:")
                 st.info(answer)
 
-                # --- Debugging Section ---
+                # Debugging
                 st.subheader("Debugging Information")
                 with st.expander("View Retrieved Documents"):
-                    # The retriever now returns the parent chunks
                     if "source_documents" in result and result["source_documents"]:
                         st.write("The following PARENT chunks were retrieved and sent to the LLM:")
                         for i, doc in enumerate(result["source_documents"]):
@@ -150,7 +127,6 @@ if st.button("Get Answer"):
                             st.json(doc.metadata)
                     else:
                         st.write("No documents were retrieved for this query.")
-
             except Exception as e:
                 st.error(f"An error occurred: {e}")
     else:
