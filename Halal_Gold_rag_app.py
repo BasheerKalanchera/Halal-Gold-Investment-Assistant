@@ -7,7 +7,7 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_huggingface import HuggingFaceEmbeddings # New import
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
@@ -59,7 +59,7 @@ def log_unanswered_to_google_sheets(user_query, user_id="Anonymous"):
 # --- Embedding model ---
 @st.cache_resource
 def load_embedding_model():
-    return HuggingFaceEmbeddings( # Changed class name
+    return HuggingFaceEmbeddings(
         model_name="hkunlp/instructor-large",
         model_kwargs={"device": "cpu"}
     )
@@ -107,13 +107,20 @@ qa_chain = RetrievalQA.from_chain_type(
     llm=llm,
     chain_type="stuff",
     retriever=retriever,
-    return_source_documents=True,
+    return_source_documents=False, # Changed to False to remove debugging info
     chain_type_kwargs={"prompt": PromptTemplate(template=prompt_template, input_variables=["context", "question"])}
 )
 
 # --- Streamlit UI ---
 st.set_page_config(page_title="Halal Gold Investment Assistant", layout="centered")
-st.title("💰 Halal Gold Investment Assistant")
+
+# --- Added Aisar to the title
+st.title("💰 Aisar - Halal Gold Investment Assistant")
+
+# --- Added Disclaimer to the top
+st.warning("""
+Disclaimer: This tool is not intended as investment or Shariah advice. Users should not rely on its responses for financial decisions and are advised to consult with a registered financial advisor or qualified Shariah scholar.
+""")
 
 # Optional user ID
 if "user_id" not in st.session_state:
@@ -135,15 +142,8 @@ if st.button("Get Answer"):
                 if fallback_message in answer:
                     log_unanswered_to_google_sheets(user_query.strip(), st.session_state["user_id"] or "Anonymous")
 
-                st.subheader("Debugging Information")
-                with st.expander("View Retrieved Documents"):
-                    if result.get("source_documents"):
-                        for i, doc in enumerate(result["source_documents"]):
-                            st.markdown(f"**Parent Chunk {i+1}**")
-                            st.code(doc.page_content)
-                            st.json(doc.metadata)
-                    else:
-                        st.write("No documents were retrieved.")
+                # The debugging information section is now removed.
+                
             except Exception as e:
                 st.error(f"An error occurred: {e}")
     else:
